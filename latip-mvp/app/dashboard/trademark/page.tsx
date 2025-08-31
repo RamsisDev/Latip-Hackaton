@@ -13,6 +13,22 @@ import { useAuth } from "@/contexts/auth-context"
 import { DashboardNav } from "@/components/dashboard-nav"
 import { Search, Loader2, CheckCircle, AlertTriangle, FileText, Globe } from "lucide-react"
 
+import registros from "./registros.json"
+
+
+type Registro = {
+  nombre: string
+  paisProcedencia: string // código: "EC", "AR", etc.
+  fechaRegistro: string
+  numeroExpediente: string
+  titular: string
+  apoderado: string
+  seccionTipo: string
+  seccionTexto: string
+}
+type RegistrosByCountry = Record<string, Registro[]>
+const DATA = registros as RegistrosByCountry
+
 const LATAM_COUNTRIES = [
   { value: "global", label: "Global Latin America" },
   { value: "AR", label: "Argentina" },
@@ -34,59 +50,94 @@ const LATAM_COUNTRIES = [
   { value: "PE", label: "Peru" },
   { value: "UY", label: "Uruguay" },
   { value: "VE", label: "Venezuela" },
-]
+  { value: "NA", label: "Not Especified" },
+] as const
 
-// Mock data for search results
-const MOCK_PHONETIC_RESULTS = [
-  {
-    name: "TechFlow Solutions",
-    country: "Brazil",
-    status: "Active",
-    registrationId: "BR-2023-001234",
-    lastUpdate: "2023-08-15",
-  },
-  {
-    name: "TekFlo Systems",
-    country: "Mexico",
-    status: "Pending",
-    registrationId: "MX-2023-005678",
-    lastUpdate: "2023-09-02",
-  },
-  {
-    name: "TechFlex Corp",
-    country: "Argentina",
-    status: "Active",
-    registrationId: "AR-2022-009876",
-    lastUpdate: "2023-07-20",
-  },
-]
+const COUNTRY_LABEL_BY_CODE: Record<string, string> =
+  Object.fromEntries(LATAM_COUNTRIES.map(c => [c.value, c.label]))
 
-const MOCK_SEMANTIC_RESULTS = [
-  {
-    name: "FlowTech Industries",
-    nameSimilarity: 82,
-    descriptionSimilarity: 74,
-    country: "Chile",
-    status: "Active",
-    registrationId: "CL-2023-002468",
-  },
-  {
-    name: "Digital Flow Solutions",
-    nameSimilarity: 68,
-    descriptionSimilarity: 91,
-    country: "Colombia",
-    status: "Active",
-    registrationId: "CO-2023-001357",
-  },
-  {
-    name: "Tech Stream Pro",
-    nameSimilarity: 45,
-    descriptionSimilarity: 67,
-    country: "Peru",
-    status: "Expired",
-    registrationId: "PE-2021-007890",
-  },
-]
+// normaliza texto (lowercase, sin tildes, colapsa espacios)
+function normalizeText(s: string): string {
+  return s
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+// bigramas para Dice
+function bigrams(s: string): string[] {
+  const n = s.length
+  if (n < 2) return [s]
+  const grams: string[] = []
+  for (let i = 0; i < n - 1; i++) grams.push(s.slice(i, i + 2))
+  return grams
+}
+
+// Similaridad Sørensen–Dice con bigramas (0..1)
+function diceSimilarity(a: string, b: string): number {
+  const A = bigrams(normalizeText(a))
+  const B = bigrams(normalizeText(b))
+  if (A.length === 0 || B.length === 0) return 0
+  const freq = new Map<string, number>()
+  for (const g of A) freq.set(g, (freq.get(g) ?? 0) + 1)
+  let overlap = 0
+  for (const g of B) {
+    const c = freq.get(g)
+    if (c && c > 0) {
+      overlap++
+      freq.set(g, c - 1)
+    }
+  }
+  return (2 * overlap) / (A.length + B.length)
+}
+
+function toPercent(x: number) {
+  return Math.round(x * 100)
+}
+
+// ---------------------- UI helpers ----------------------
+function getStatusBadge(status: string) {
+  switch (status.toLowerCase()) {
+    case "active":
+      return <Badge className="bg-green-500/20 text-green-400 border-green-500/20">Active</Badge>
+    case "pending":
+      return <Badge className="bg-yellow-500/20 text-yellow-400 border-yellow-500/20">Pending</Badge>
+    case "expired":
+      return <Badge className="bg-red-500/20 text-red-400 border-red-500/20">Expired</Badge>
+    default:
+      return <Badge variant="outline">{status}</Badge>
+  }
+}
+
+function getSimilarityBadge(percentage: number) {
+  if (percentage >= 80) {
+    return <Badge className="bg-red-500/20 text-red-400 border-red-500/20">{percentage}%</Badge>
+  } else if (percentage >= 60) {
+    return <Badge className="bg-yellow-500/20 text-yellow-400 border-yellow-500/20">{percentage}%</Badge>
+  } else {
+    return <Badge className="bg-green-500/20 text-green-400 border-green-500/20">{percentage}%</Badge>
+  }
+}
+
+// ---------------------- Tipos de resultados ----------------------
+const MOCK_PHONETIC_RESULTS: Array<{
+  name: string
+  country: string
+  status: string
+  registrationId: string
+  lastUpdate: string
+}> = []
+
+const MOCK_SEMANTIC_RESULTS: Array<{
+  name: string
+  nameSimilarity: number
+  descriptionSimilarity: number
+  country: string
+  status: string
+  registrationId: string
+}> = []
 
 interface SearchResults {
   hasMatches: boolean
@@ -96,103 +147,84 @@ interface SearchResults {
   searchedName: string
 }
 
+// ---------------------- Búsqueda principal ----------------------
+function searchSemanticByName(term: string, countryCode: string): typeof MOCK_SEMANTIC_RESULTS {
+  const THRESHOLD = 0.3 // 30%
+  const pool: Registro[] =
+    !countryCode || countryCode === "global"
+      ? Object.values(DATA).flat()
+      : (DATA[countryCode] ?? [])
+
+  const matches = pool
+    .map(reg => ({
+      reg,
+      score: diceSimilarity(term, reg.nombre),
+    }))
+    .filter(x => x.score >= THRESHOLD)
+    .sort((a, b) => b.score - a.score)
+
+  const mapped = matches.map(({ reg, score }) => ({
+    name: reg.nombre,
+    nameSimilarity: toPercent(score),
+    descriptionSimilarity: 0, // no tenemos descripción; dejamos 0
+    country: COUNTRY_LABEL_BY_CODE[reg.paisProcedencia] ?? reg.paisProcedencia,
+    status: "N/A",
+    registrationId: reg.numeroExpediente,
+  }))
+
+  return mapped as typeof MOCK_SEMANTIC_RESULTS
+}
+
+// ---------------------- Componente ----------------------
 export default function TrademarkSearchPage() {
   const [trademarkName, setTrademarkName] = useState("")
-  const [country, setCountry] = useState("")
-  const [description, setDescription] = useState("")
+  const [country, setCountry] = useState<string>("")
   const [loading, setLoading] = useState(false)
   const [results, setResults] = useState<SearchResults | null>(null)
   const { user, updateTokens } = useAuth()
 
   const handleSearch = async (e: React.FormEvent) => {
     e.preventDefault()
+    if (!trademarkName.trim() || !country) return
 
-    if (!trademarkName.trim() || !country) {
-      return
-    }
-
-    if (!user || user.tokens <= 0) {
-      alert("Insufficient tokens. Please purchase more tokens from your wallet.")
-      return
-    }
+    // if (!user || user.tokens <= 0) {
+    //   alert("Insufficient tokens. Please purchase more tokens from your wallet.")
+    //   return
+    // }
 
     setLoading(true)
     setResults(null)
 
-    // Deduct 1 token
-    updateTokens(user.tokens - 1)
+    // ⚠️ Esto solo descuenta en el cliente (no es seguro)
+    //updateTokens(user.tokens - 1)
 
-    // Simulate API call with loading spinner
-    await new Promise((resolve) => setTimeout(resolve, 2500))
+    // Simula latencia
+    await new Promise((r) => setTimeout(r, 800))
 
-    // Mock search logic - randomly determine if matches exist
-    const hasMatches =  true
-    //Math.random() > 0.5 // 70% chance of matches
+    const semanticMatches = searchSemanticByName(trademarkName, country)
+    const hasMatches = semanticMatches.length > 0
 
     const searchResults: SearchResults = {
       hasMatches,
-      phoneticMatches: hasMatches ? MOCK_PHONETIC_RESULTS : [],
-      semanticMatches: hasMatches ? MOCK_SEMANTIC_RESULTS : [],
-      searchedCountry: LATAM_COUNTRIES.find((c) => c.value === country)?.label || country,
+      phoneticMatches: [], // si quieres, puedes replicar los mismos que semanticMatches
+      semanticMatches,
+      searchedCountry: COUNTRY_LABEL_BY_CODE[country] ?? country,
       searchedName: trademarkName,
     }
 
     setResults(searchResults)
     setLoading(false)
-
-    // API placeholder for future backend integration
-    /*
-    try {
-      const response = await fetch('/api/trademark/search', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: trademarkName,
-          country,
-          description
-        })
-      });
-      const data = await response.json();
-      setResults(data);
-    } catch (error) {
-      console.error('Search failed:', error);
-    }
-    */
-  }
-
-  const getStatusBadge = (status: string) => {
-    switch (status.toLowerCase()) {
-      case "active":
-        return <Badge className="bg-green-500/20 text-green-400 border-green-500/20">Active</Badge>
-      case "pending":
-        return <Badge className="bg-yellow-500/20 text-yellow-400 border-yellow-500/20">Pending</Badge>
-      case "expired":
-        return <Badge className="bg-red-500/20 text-red-400 border-red-500/20">Expired</Badge>
-      default:
-        return <Badge variant="outline">{status}</Badge>
-    }
-  }
-
-  const getSimilarityBadge = (percentage: number) => {
-    if (percentage >= 80) {
-      return <Badge className="bg-red-500/20 text-red-400 border-red-500/20">{percentage}%</Badge>
-    } else if (percentage >= 60) {
-      return <Badge className="bg-yellow-500/20 text-yellow-400 border-yellow-500/20">{percentage}%</Badge>
-    } else {
-      return <Badge className="bg-green-500/20 text-green-400 border-green-500/20">{percentage}%</Badge>
-    }
   }
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
-      {/* Navigation Sidebar */}
+      {/* Sidebar */}
       <div className="lg:col-span-1">
         <DashboardNav showBackButton backHref="/dashboard" backLabel="Back to Dashboard" />
       </div>
 
-      {/* Main Content */}
+      {/* Main */}
       <div className="lg:col-span-3 space-y-6">
-        {/* Header */}
         <div className="space-y-2">
           <h1 className="text-3xl font-bold bg-gradient-to-r from-primary to-secondary bg-clip-text text-transparent">
             Trademark Search
@@ -202,19 +234,18 @@ export default function TrademarkSearchPage() {
           </p>
         </div>
 
-        {/* Search Form */}
+        {/* Form */}
         <Card className="border-primary/20 bg-card/50 backdrop-blur-sm">
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <Search className="h-5 w-5 text-primary" />
               Search Parameters
             </CardTitle>
-            <CardDescription>Enter your trademark details to search across our comprehensive database.</CardDescription>
+            <CardDescription>Enter your trademark details to search across our database.</CardDescription>
           </CardHeader>
           <CardContent>
             <form onSubmit={handleSearch} className="space-y-6">
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {/* Trademark Name */}
                 <div className="space-y-2">
                   <label htmlFor="trademark-name" className="text-sm font-medium">
                     Trademark Name *
@@ -230,21 +261,20 @@ export default function TrademarkSearchPage() {
                   />
                 </div>
 
-                {/* Country Selection */}
                 <div className="space-y-2">
                   <label htmlFor="country" className="text-sm font-medium">
                     Country/Region *
                   </label>
-                  <Select value={country} onValueChange={setCountry} required>
+                  <Select value={country} onValueChange={setCountry}>
                     <SelectTrigger className="bg-input border-border focus:border-primary">
                       <SelectValue placeholder="Select country or region" />
                     </SelectTrigger>
                     <SelectContent>
-                      {LATAM_COUNTRIES.map((country) => (
-                        <SelectItem key={country.value} value={country.value}>
+                      {LATAM_COUNTRIES.map((c) => (
+                        <SelectItem key={c.value} value={c.value}>
                           <div className="flex items-center gap-2">
-                            {country.value === "global" && <Globe className="h-4 w-4" />}
-                            {country.label}
+                            {c.value === "global" && <Globe className="h-4 w-4" />}
+                            {c.label}
                           </div>
                         </SelectItem>
                       ))}
@@ -253,21 +283,6 @@ export default function TrademarkSearchPage() {
                 </div>
               </div>
 
-              {/* Description */}
-              <div className="space-y-2">
-                <label htmlFor="description" className="text-sm font-medium">
-                  Description (Optional)
-                </label>
-                <Textarea
-                  id="description"
-                  placeholder="Describe your trademark, products, or services..."
-                  value={description}
-                  onChange={(e) => setDescription(e.target.value)}
-                  className="bg-input border-border focus:border-primary transition-colors min-h-[100px]"
-                />
-              </div>
-
-              {/* Search Button */}
               <Button
                 type="submit"
                 disabled={loading || !trademarkName.trim() || !country}
@@ -289,7 +304,7 @@ export default function TrademarkSearchPage() {
           </CardContent>
         </Card>
 
-        {/* Loading State */}
+        {/* Loading */}
         {loading && (
           <Card className="border-secondary/20 bg-secondary/5">
             <CardContent className="p-8 text-center">
@@ -311,7 +326,6 @@ export default function TrademarkSearchPage() {
         {results && !loading && (
           <div className="space-y-6">
             {!results.hasMatches ? (
-              /* No Matches Found */
               <Card className="border-green-500/20 bg-green-500/5">
                 <CardContent className="p-8 text-center">
                   <CheckCircle className="h-16 w-16 text-green-400 mx-auto mb-4" />
@@ -325,7 +339,6 @@ export default function TrademarkSearchPage() {
                 </CardContent>
               </Card>
             ) : (
-              /* Matches Found */
               <div className="space-y-6">
                 <Card className="border-yellow-500/20 bg-yellow-500/5">
                   <CardContent className="p-6 text-center">
@@ -338,51 +351,14 @@ export default function TrademarkSearchPage() {
                   </CardContent>
                 </Card>
 
-                {/* Phonetic Similarity Table */}
-                <Card className="border-primary/20">
-                  <CardHeader>
-                    <CardTitle className="flex items-center gap-2">
-                      <FileText className="h-5 w-5 text-primary" />
-                      Phonetic Similarity Matches
-                    </CardTitle>
-                    <CardDescription>Trademarks that sound similar to your search term</CardDescription>
-                  </CardHeader>
-                  <CardContent>
-                    <div className="overflow-x-auto">
-                      <Table>
-                        <TableHeader>
-                          <TableRow className="border-border/50">
-                            <TableHead>Trademark Name</TableHead>
-                            <TableHead>Country</TableHead>
-                            <TableHead>Status</TableHead>
-                            <TableHead>Registration ID</TableHead>
-                            <TableHead>Last Update</TableHead>
-                          </TableRow>
-                        </TableHeader>
-                        <TableBody>
-                          {results.phoneticMatches.map((match, index) => (
-                            <TableRow key={index} className="border-border/30 hover:bg-muted/50">
-                              <TableCell className="font-medium">{match.name}</TableCell>
-                              <TableCell>{match.country}</TableCell>
-                              <TableCell>{getStatusBadge(match.status)}</TableCell>
-                              <TableCell className="font-mono text-sm">{match.registrationId}</TableCell>
-                              <TableCell>{match.lastUpdate}</TableCell>
-                            </TableRow>
-                          ))}
-                        </TableBody>
-                      </Table>
-                    </div>
-                  </CardContent>
-                </Card>
-
-                {/* Semantic & Description Similarity Table */}
+                {/* Renombrado: ahora son resultados SEMÁNTICOS */}
                 <Card className="border-secondary/20">
                   <CardHeader>
                     <CardTitle className="flex items-center gap-2">
                       <Search className="h-5 w-5 text-secondary" />
-                      Semantic & Description Similarity
+                      Semantic Similarity Matches
                     </CardTitle>
-                    <CardDescription>Trademarks with similar meaning or description content</CardDescription>
+                    <CardDescription>Trademarks similar to your search term (by name)</CardDescription>
                   </CardHeader>
                   <CardContent>
                     <div className="overflow-x-auto">
@@ -391,9 +367,8 @@ export default function TrademarkSearchPage() {
                           <TableRow className="border-border/50">
                             <TableHead>Trademark Name</TableHead>
                             <TableHead>Name Similarity</TableHead>
-                            <TableHead>Description Similarity</TableHead>
-                            <TableHead>Country</TableHead>
                             <TableHead>Status</TableHead>
+                            <TableHead>Country</TableHead>
                             <TableHead>Registration ID</TableHead>
                           </TableRow>
                         </TableHeader>
@@ -402,9 +377,8 @@ export default function TrademarkSearchPage() {
                             <TableRow key={index} className="border-border/30 hover:bg-muted/50">
                               <TableCell className="font-medium">{match.name}</TableCell>
                               <TableCell>{getSimilarityBadge(match.nameSimilarity)}</TableCell>
-                              <TableCell>{getSimilarityBadge(match.descriptionSimilarity)}</TableCell>
-                              <TableCell>{match.country}</TableCell>
                               <TableCell>{getStatusBadge(match.status)}</TableCell>
+                              <TableCell>{match.country}</TableCell>
                               <TableCell className="font-mono text-sm">{match.registrationId}</TableCell>
                             </TableRow>
                           ))}
@@ -416,7 +390,6 @@ export default function TrademarkSearchPage() {
               </div>
             )}
 
-            {/* Search Again */}
             <Card className="border-accent/20 bg-accent/5">
               <CardContent className="p-6 text-center">
                 <h3 className="text-lg font-semibold mb-2">Need Another Search?</h3>
@@ -428,7 +401,6 @@ export default function TrademarkSearchPage() {
                     setResults(null)
                     setTrademarkName("")
                     setCountry("")
-                    setDescription("")
                   }}
                   variant="outline"
                   className="border-accent/20 hover:border-accent/40 hover:bg-accent/10"
